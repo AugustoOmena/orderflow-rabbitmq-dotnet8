@@ -16,6 +16,41 @@ services:
     networks:
       - orderflow-net
 
+  api:
+    build:
+      context: .
+      dockerfile: src/OrderFlow.Api/Dockerfile
+    container_name: orderflow-api
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_HTTP_PORTS=8080
+      - RabbitMq__Host=rabbitmq
+      - RabbitMq__User=guest
+      - RabbitMq__Pass=guest
+    ports:
+      - "5050:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - orderflow-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: src/OrderFlow.Worker/Dockerfile
+    container_name: orderflow-worker
+    environment:
+      - DOTNET_ENVIRONMENT=Development
+      - RabbitMq__Host=rabbitmq
+      - RabbitMq__User=guest
+      - RabbitMq__Pass=guest
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - orderflow-net
+
 networks:
   orderflow-net:
     driver: bridge
