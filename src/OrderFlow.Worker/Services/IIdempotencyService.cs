@@ -1,29 +1,41 @@
-using System.Collections.Concurrent;
+using StackExchange.Redis;
 
 namespace OrderFlow.Worker.Services;
 
 public interface IIdempotencyService
 {
-    Task<bool> HasBeenProcessedAsync(Guid correlationId, CancellationToken cancellationToken = default);
-    Task MarkAsProcessedAsync(Guid correlationId, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Tenta adquirir o lock/registro atômico de processamento para o EventId.
+    /// Retorna true se é a primeira vez que o evento está sendo processado.
+    /// </summary>
+    Task<bool> TryAcquireProcessingLockAsync(Guid eventId, TimeSpan ttl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Libera a chave em caso de falha transitória para permitir que o mecanismo de Retry reexecute o evento.
+    /// </summary>
+    Task ReleaseLockAsync(Guid eventId, CancellationToken cancellationToken = default);
 }
 
-/// <summary>
-/// Implementação thread-safe em memória para controle de idempotência.
-/// Em produção distribuída com múltiplas réplicas, substituir por Redis (SETNX) ou tabela com Unique Constraint.
-/// </summary>
-public sealed class MemoryIdempotencyService : IIdempotencyService
+public sealed class RedisIdempotencyService : IIdempotencyService
 {
-    private readonly ConcurrentDictionary<Guid, DateTime> _processedMessages = new();
+    private readonly IDatabase _database;
+    private const string KeyPrefix = "orderflow:idempotency:";
 
-    public Task<bool> HasBeenProcessedAsync(Guid correlationId, CancellationToken cancellationToken = default)
+    public RedisIdempotencyService(IConnectionMultiplexer redis)
     {
-        return Task.FromResult(_processedMessages.ContainsKey(correlationId));
+        _database = redis.GetDatabase();
     }
 
-    public Task MarkAsProcessedAsync(Guid correlationId, CancellationToken cancellationToken = default)
+    public async Task<bool> TryAcquireProcessingLockAsync(Guid eventId, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
-        _processedMessages.TryAdd(correlationId, DateTime.UtcNow);
-        return Task.CompletedTask;
+        var key = $"{KeyPrefix}{eventId}";
+        // Operação atômica SET NX EX no Redis: evita race condition entre múltiplos workers concorrentes
+        return await _database.StringSetAsync(key, DateTime.UtcNow.ToString("O"), ttl, When.NotExists);
+    }
+
+    public async Task ReleaseLockAsync(Guid eventId, CancellationToken cancellationToken = default)
+    {
+        var key = $"{KeyPrefix}{eventId}";
+        await _database.KeyDeleteAsync(key);
     }
 }

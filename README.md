@@ -1,19 +1,18 @@
 <div align="center">
-  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/rabbitmq/rabbitmq-original.svg" alt="RabbitMQ Logo" width="100" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/rabbitmq/rabbitmq-original.svg" alt="RabbitMQ Logo" width="90" />
   <h1>OrderFlow Engine</h1>
-  <p><strong>Resilient Event-Driven Architecture with .NET 8, MassTransit & RabbitMQ</strong></p>
+  <p><strong>Resilient Event-Driven Architecture with .NET 8, MassTransit, RabbitMQ & Redis</strong></p>
 </div>
-
-Arquitetura orientada a eventos (EDA) construída em **.NET 8** com **MassTransit** e **RabbitMQ**, demonstrando padrões corporativos de resiliência, tolerância a falhas, processamento idempotente e observabilidade distribuída.
 
 ---
 
 ## Arquitetura & Topologia AMQP
 
 ```text
-[Client] ──(HTTP POST)──▶ [OrderFlow.Api (Producer)]
+[Client] ──(HTTP POST)──▶ [OrderFlow.Api (Vertical Slice)]
                                  │
-                                 ▼ Publish (Persistent + CorrelationId)
+                                 ▼ Publish (Persistent + CorrelationId + EventId)
                  ┌───────────────────────────────┐
                  │ Exchange: OrderPlacedEvent    │
                  │ (Fanout, Durable)             │
@@ -25,100 +24,124 @@ Arquitetura orientada a eventos (EDA) construída em **.NET 8** com **MassTransi
                  │ (Durable)                     │
                  └───────────────┬───────────────┘
                                  │
-                      [OrderFlow.Worker]
+               ┌─────────────────┴─────────────────┐
+               ▼                                   ▼
+     [OrderFlow.Worker #1]               [OrderFlow.Worker #2]
+               │                                   │
+               └─────────────────┬─────────────────┘
+                                 ▼
+               [Pipeline Filter: IdempotencyConsumeFilter] ◀──▶ [Redis (SET NX EX)]
                                  │
                   ┌──────────────┴──────────────┐
                   │                             │
              [Sucesso]               [Falha após 3 Retries]
                   │                             │
                   ▼                             ▼
-           Idempotency Store       [Queue: order-flow.order-placed_error]
-           + BasicAck              (Dead Letter Queue / Auditoria)
+              BasicAck             [Queue: order-flow.order-placed_error]
+                                   (Dead Letter Queue / Auditoria)
+
 ```
 
-## Pilares Implementados
+### Pilares Arquiteturais Implementados
 
+- **Vertical Slice & Clean Composition:** Endpoints isolados por feature (`Features/Orders`) e configurações de infraestrutura encapsuladas em métodos de extensão (`Extensions/`), mantendo o `Program.cs` declarativo.
 - **Topologia Explícita & Durabilidade:** Exchanges e filas duráveis (`durable = true`) com mensagens persistentes (`delivery_mode = 2`), sobrevivendo a reinicializações do broker.
-- **Resiliência & Backoff Incremental:** Política de retentativas automáticas (3 tentativas com intervalos crescentes de 1s, 3s e 5s) para falhas transitórias a jusante.
+- **Idempotência Distribuída via Pipeline Filter:** Middleware global no MassTransit (`IdempotencyConsumeFilter<T>`) utilizando operações atômicas no **Redis** (`SET NX EX`), permitindo escalar múltiplas réplicas de workers sem processamento duplicado.
+- **Resiliência & Backoff Incremental:** Política de retentativas automáticas (3 tentativas adicionais com intervalos crescentes de `1s`, `3s` e `5s`).
 - **Dead Letter Queue (DLQ):** Isolamento automático de mensagens com falha persistente na fila `order-flow.order-placed_error`, preservando stack traces e headers originais sem bloquear o consumo principal.
-- **Idempotência:** Deduplicação de mensagens baseada em `CorrelationId` antes da execução de efeitos colaterais de negócio.
-- **Controle de Vazão (QoS):** `PrefetchCount = 16`, limitando mensagens não confirmadas em trânsito por consumidor.
-- **Observabilidade & Health Checks:** Propagação de `CorrelationId` nos logs estruturados e endpoint `/health` validando a conectividade ativa com o broker.
+- **Controle de Vazão (QoS):** `PrefetchCount = 16` limitando mensagens não confirmadas em trânsito por consumidor.
 
 ---
 
-## Quickstart (Execução em 1 Comando)
+## Passo a Passo de Execução e Validação
 
-Suba o cluster completo (RabbitMQ + API + Worker) via Docker Compose:
+### Passo 1: Subir o Cluster Completo (com 2 Réplicas do Worker)
 
-bash
+Na raiz do repositório, execute:
 
 ```bash
-docker compose up --build -d
+docker compose up --build -d --scale worker=2
+
 ```
 
-**Swagger UI (API):** [http://localhost:5050/swagger](http://localhost:5050/swagger)
+Verifique se todos os serviços (`rabbitmq`, `redis`, `api` e as 2 instâncias de `worker`) estão saudáveis:
 
-**Health Check:** [http://localhost:5050/health](http://localhost:5050/health)
+```bash
+docker compose ps
 
-**RabbitMQ Management UI:** [http://localhost:15672](http://localhost:15672) (`guest / guest`)
+```
 
----
+### Passo 2: Validar Saúde e Interfaces Web
 
-## Cenários de Teste
+1. **Health Check da API + Broker:**
 
-### 1\. Fluxo Normal (Happy Path)
+```bash
+curl -s http://localhost:5050/health
 
-Execute a requisição para simular o processamento normal de um pedido:
+```
 
-bash
+2. **Interfaces de Gerenciamento:**
+
+- **Swagger UI (API):** [http://localhost:5050/swagger](http://localhost:5050/swagger)
+- **RabbitMQ Management UI:** [http://localhost:15672](http://localhost:15672) (Usuário: `guest` | Senha: `guest`)
+
+### Passo 3: Testar o Fluxo Normal (Happy Path)
+
+Em uma aba do terminal, acompanhe os logs distribuídos entre as duas instâncias de workers:
+
+```bash
+docker compose logs -f worker
+
+```
+
+Em outra aba, envie um pedido válido com itens:
 
 ```bash
 curl -X POST http://localhost:5050/api/orders \
   -H "Content-Type: application/json" \
   -d '{
     "customerEmail": "cliente@empresa.com",
-    "totalAmount": 320.50,
+    "currency": "BRL",
+    "items": [
+      { "sku": "LEGO-42096", "productName": "Porsche 911 RSR", "quantity": 1, "unitPrice": 1499.90 },
+      { "sku": "TECH-001", "productName": "Cabo USB-C", "quantity": 2, "unitPrice": 45.00 }
+    ],
     "simulateDownstreamFailure": false
   }'
+
 ```
 
-Verifique o processamento nos logs do Worker:
+### Passo 4: Testar Resiliência, Retries e Dead Letter Queue (DLQ)
 
-bash
-
-```bash
-docker compose logs -f worker
-```
-
-### 2\. Tolerância a Falhas & Roteamento para DLQ
-
-Execute a requisição simulando uma falha no serviço downstream:
-
-bash
+Dispare um pedido simulando indisponibilidade de gateway externo (`simulateDownstreamFailure: true`):
 
 ```bash
 curl -X POST http://localhost:5050/api/orders \
   -H "Content-Type: application/json" \
   -d '{
     "customerEmail": "auditoria@empresa.com",
-    "totalAmount": 999.90,
+    "currency": "BRL",
+    "items": [
+      { "sku": "SRV-999", "productName": "Licença Enterprise", "quantity": 1, "unitPrice": 2500.00 }
+    ],
     "simulateDownstreamFailure": true
   }'
+
 ```
 
-Acompanhe as 3 retentativas com backoff nos logs do Worker e inspecione a mensagem capturada na fila `order-flow.order-placed_error` através do painel web do RabbitMQ:
+1. Nos logs do `worker`, observe o filtro de idempotência liberando o lock em caso de exceção para permitir que o motor de retry execute a tentativa inicial + 3 retries (`1s`, `3s`, `5s`).
+2. Esgotadas as tentativas, inspecione a mensagem isolada na fila `order-flow.order-placed_error` em [http://localhost:15672/#/queues](http://localhost:15672/#/queues).
 
-[http://localhost:15672/#/queues](http://localhost:15672/#/queues)
-
----
-
-## Encerramento
-
-Para interromper os containers e remover os volumes associados:
-
-bash
+### Passo 5: Encerrar o Ambiente
 
 ```bash
 docker compose down -v
+
 ```
+
+---
+
+## Trade-offs & Próximos Passos (Evolução para Produção)
+
+- **Transactional Outbox / Inbox:** Atualmente a API publica diretamente no broker e o Worker controla idempotência via Redis com liberação de lock em exceções. Em cenários financeiros críticos com persistência relacional, recomenda-se o _MassTransit Entity Framework Outbox_ para garantir atomicidade ACID entre banco de dados e mensageria.
+- **Testes de Integração:** Adicionar suíte com `xUnit` + `Testcontainers` para validar topologia, retries e DLQ em pipeline de CI/CD.
